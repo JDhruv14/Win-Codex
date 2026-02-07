@@ -99,16 +99,6 @@ Build a self-contained app and a Desktop shortcut:
 | Reuse existing    | `.\scripts\run.ps1 -BuildExe -Reuse` (skips re-extract) |
 | Custom work dir   | `.\scripts\run.ps1 -WorkDir .\mywork`                 |
 
-## Notes
-
-- This is **not** an official OpenAI project.
-- Do **not** redistribute the Codex DMG or OpenAI binaries; use your own installer.
-- **Native modules**: If compilation fails (e.g. no Visual Studio), the script tries prebuilt binaries. If none are available for your Electron version, install [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) and run again.
-
-## License
-
-MIT (for the scripts in this repository only).
-
 ---
 
 **Creator:** [@dhruvtwt_](https://x.com/dhruvtwt_)
