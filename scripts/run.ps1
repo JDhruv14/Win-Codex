@@ -3,8 +3,7 @@ param(
   [string]$WorkDir = (Join-Path $PSScriptRoot "..\work"),
   [string]$CodexCliPath,
   [switch]$Reuse,
-  [switch]$NoLaunch,
-  [switch]$BuildExe
+  [switch]$NoLaunch
 )
 
 Set-StrictMode -Version Latest
@@ -71,7 +70,7 @@ function Resolve-CodexCliPath([string]$Explicit) {
   } catch {}
 
   try {
-    $npmRoot = (& npm root -g 2>$null).Trim()
+    $npmRoot = (& $npmCmd root -g 2>$null).Trim()
     if ($npmRoot) {
       $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "aarch64-pc-windows-msvc" } else { "x86_64-pc-windows-msvc" }
       $candidates += (Join-Path $npmRoot "@openai\codex\vendor\$arch\codex\codex.exe")
@@ -100,6 +99,76 @@ function Resolve-CodexCliPath([string]$Explicit) {
   return $null
 }
 
+function Ensure-LocalCodexCli([string]$BaseDir) {
+  if (-not $BaseDir) { return $null }
+  $cliRoot = Join-Path $BaseDir "codex-cli"
+  New-Item -ItemType Directory -Force -Path $cliRoot | Out-Null
+
+  $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "aarch64-pc-windows-msvc" } else { "x86_64-pc-windows-msvc" }
+  $modernPkg = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "@openai\codex-win32-arm64" } else { "@openai\codex-win32-x64" }
+  $modernVendorExe = Join-Path $cliRoot "node_modules\$modernPkg\vendor\$arch\codex\codex.exe"
+  $legacyVendorExe = Join-Path $cliRoot "node_modules\@openai\codex\vendor\$arch\codex\codex.exe"
+  if (Test-Path $modernVendorExe) { return $modernVendorExe }
+  if (Test-Path $legacyVendorExe) { return $legacyVendorExe }
+
+  Push-Location $cliRoot
+  try {
+    if (-not (Test-Path (Join-Path $cliRoot "package.json"))) {
+      & $npmCmd init -y | Out-Null
+      if ($LASTEXITCODE -ne 0) { throw "npm init failed for local codex-cli workspace." }
+    }
+
+    & $npmCmd install --no-save @openai/codex@latest | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "npm install @openai/codex@latest failed." }
+  } finally {
+    Pop-Location
+  }
+
+  if (Test-Path $modernVendorExe) { return $modernVendorExe }
+  if (Test-Path $legacyVendorExe) { return $legacyVendorExe }
+  $fallback = Get-ChildItem -Recurse -File -Path (Join-Path $cliRoot "node_modules") -Filter "codex.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($fallback) { return $fallback.FullName }
+  return $null
+}
+
+function Escape-JsString([string]$Text) {
+  if ($null -eq $Text) { return "" }
+  return ($Text -replace '\\', '\\\\' -replace '"', '\"')
+}
+
+function Resolve-WslDefaultDistro() {
+  try {
+    $status = (& wsl.exe --status 2>$null | Out-String)
+    $m = [regex]::Match($status, 'Default Distribution:\s*(.+)')
+    if ($m.Success) {
+      $name = ($m.Groups[1].Value -replace "`0", "").Trim()
+      if ($name) { return $name }
+    }
+  } catch {}
+
+  try {
+    $list = & wsl.exe -l -q 2>$null
+    foreach ($line in $list) {
+      $name = ($line -replace "`0", "").Trim()
+      if ($name) { return $name }
+    }
+  } catch {}
+
+  return $null
+}
+
+function Resolve-WslCodexPath([string]$Distro) {
+  if (-not $Distro) { return $null }
+  try {
+    $cmd = 'export NVM_DIR=$HOME/.nvm; [ -s $NVM_DIR/nvm.sh ] && . $NVM_DIR/nvm.sh; command -v codex || true'
+    $path = (& wsl.exe -d $Distro --exec /usr/bin/env bash -lc $cmd 2>$null | Out-String).Trim()
+    if (-not $path) { return $null }
+    if ($path -like "/mnt/c/*") { return $null }
+    return $path
+  } catch {}
+  return $null
+}
+
 function Write-Header([string]$Text) {
   Write-Host "`n=== $Text ===" -ForegroundColor Cyan
 }
@@ -118,37 +187,78 @@ function Patch-Preload([string]$AppDir) {
   }
 }
 
-function Patch-MainForPortable([string]$AppDir, [string]$BuildNumber, [string]$BuildFlavor) {
-  $mainJs = Join-Path $AppDir ".vite\build\main.js"
-  if (-not (Test-Path $mainJs)) { return }
-  $raw = Get-Content -Raw $mainJs
-  $marker = "/* CODEX-PORTABLE-SHIM */"
-  if ($raw -like "*$marker*") { return }
-  $shim = @"
-/* CODEX-PORTABLE-SHIM */
-(function(){
-  const path=require("node:path"),url=require("node:url");
-  if(!process.env.ELECTRON_RENDERER_URL){
-    const webview=path.join(__dirname,"..","..","webview","index.html");
-    try{require("node:fs").accessSync(webview)}catch(e){
-      const res=process.resourcesPath||path.join(__dirname,"..","..","..");
-      const alt=path.join(res,"app","webview","index.html");
-      try{require("node:fs").accessSync(alt);process.env.ELECTRON_RENDERER_URL=url.pathToFileURL(alt).toString()}catch(e2){}
+function Patch-MainSqliteFallback([string]$AppDir) {
+  $mainDir = Join-Path $AppDir ".vite\build"
+  if (-not (Test-Path $mainDir)) { return }
+  $mainFiles = Get-ChildItem -Path $mainDir -Filter "main-*.js" -File -ErrorAction SilentlyContinue
+  if (-not $mainFiles) { return }
+
+  foreach ($mainFile in $mainFiles) {
+    $raw = Get-Content -Raw $mainFile.FullName
+    if ($raw -like "*better-sqlite3 unavailable; automations db disabled*") { continue }
+    if ($raw -notlike "*if(!process.versions.electron)return null*") { continue }
+    if ($raw -notlike '*join(n,"sqlite")*') { continue }
+
+    $pattern = 'function (?<fn>[A-Za-z0-9_$]+)\(t\)\{if\(!process\.versions\.electron\)return null;if\((?<cache>[A-Za-z0-9_$]+)\)return \k<cache>;const e=(?<req>[A-Za-z0-9_$]+)\(\),n=(?<pathFn>[A-Za-z0-9_$]+)\(\{\}\),r=(?<pathObj>[A-Za-z0-9_$]+)\.join\(n,"sqlite"\);(?<fsObj>[A-Za-z0-9_$]+)\.mkdirSync\(r,\{recursive:!0\}\);const i=(?<dbNameFn>[A-Za-z0-9_$]+)\(\),a=\k<pathObj>\.join\(r,i\),o=new e\(a\);return (?<initFn>[A-Za-z0-9_$]+)\(o\),\k<cache>=o,o\}'
+    $replacement = {
+      param($m)
+      $fn = $m.Groups['fn'].Value
+      $cache = $m.Groups['cache'].Value
+      $req = $m.Groups['req'].Value
+      $pathFn = $m.Groups['pathFn'].Value
+      $pathObj = $m.Groups['pathObj'].Value
+      $fsObj = $m.Groups['fsObj'].Value
+      $dbNameFn = $m.Groups['dbNameFn'].Value
+      $initFn = $m.Groups['initFn'].Value
+      return "function $fn(t){if(!process.versions.electron)return null;if($cache===!1)return null;if($cache)return $cache;try{const e=$req(),n=$pathFn({}),r=$pathObj.join(n,""sqlite"");$fsObj.mkdirSync(r,{recursive:!0});const i=$dbNameFn(),a=$pathObj.join(r,i),o=new e(a);return $initFn(o),$cache=o,o}catch(e){return console.warn(""better-sqlite3 unavailable; automations db disabled"",(e&&e.message)?e.message:e),$cache=!1,null}}"
     }
-    if(!process.env.ELECTRON_RENDERER_URL){
-      process.env.ELECTRON_RENDERER_URL=url.pathToFileURL(webview).toString();
+
+    $patched = [regex]::Replace($raw, $pattern, [System.Text.RegularExpressions.MatchEvaluator]$replacement, 1)
+    if ($patched -ne $raw) {
+      Set-Content -NoNewline -Path $mainFile.FullName -Value $patched
     }
   }
-  if(!process.env.ELECTRON_FORCE_IS_PACKAGED)process.env.ELECTRON_FORCE_IS_PACKAGED="1";
-  if(!process.env.CODEX_BUILD_NUMBER)process.env.CODEX_BUILD_NUMBER="$BuildNumber";
-  if(!process.env.CODEX_BUILD_FLAVOR)process.env.CODEX_BUILD_FLAVOR="$BuildFlavor";
-  if(!process.env.BUILD_FLAVOR)process.env.BUILD_FLAVOR="$BuildFlavor";
-  if(!process.env.NODE_ENV)process.env.NODE_ENV="production";
-  if(!process.env.PWD)process.env.PWD=process.cwd();
-})();
-"@
-  $raw = $shim + "`n" + $raw
-  Set-Content -NoNewline -Path $mainJs -Value $raw
+}
+
+function Patch-MainCliCompat([string]$AppDir) {
+  $mainDir = Join-Path $AppDir ".vite\build"
+  if (-not (Test-Path $mainDir)) { return }
+  $mainFile = Get-ChildItem -Path $mainDir -Filter "main-*.js" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+  if (-not $mainFile) { return }
+
+  $raw = Get-Content -Raw $mainFile.FullName
+  if ($raw -notlike "*--analytics-default-enabled*") { return }
+  $old = 'args:["app-server","--analytics-default-enabled"]'
+  $new = 'args:["app-server"]'
+  if ($raw.Contains($old)) {
+    $raw = $raw.Replace($old, $new)
+    Set-Content -NoNewline -Path $mainFile.FullName -Value $raw
+    return
+  }
+}
+
+function Patch-MainWslBackend([string]$AppDir) {
+  $mainDir = Join-Path $AppDir ".vite\build"
+  if (-not (Test-Path $mainDir)) { return }
+  $mainFile = Get-ChildItem -Path $mainDir -Filter "main-*.js" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+  if (-not $mainFile) { return }
+
+  $distro = Resolve-WslDefaultDistro
+  $linuxCodex = Resolve-WslCodexPath $distro
+  if (-not $distro -or -not $linuxCodex) { return }
+
+  $raw = Get-Content -Raw $mainFile.FullName
+  $distroEsc = Escape-JsString $distro
+  $wslCmd = 'export NVM_DIR=$HOME/.nvm; [ -s $NVM_DIR/nvm.sh ] && . $NVM_DIR/nvm.sh; codex app-server'
+  $wslCmdEsc = Escape-JsString $wslCmd
+  $new = "function bue(t){const e=t.hostConfig.codex_cli_command;if(e&&e.length>0){const[r,...i]=e;return!r||r.trim().length===0?null:{executablePath:r,args:i}}return{executablePath:`"C:/Windows/System32/wsl.exe`",args:[`"-d`",`"$distroEsc`",`"--exec`",`"/usr/bin/env`",`"bash`",`"-lc`",`"$wslCmdEsc`"],binDirectory:null}}"
+
+  $pattern = 'function bue\(t\)\{const e=t\.hostConfig\.codex_cli_command;if\(e&&e\.length>0\)\{const\[r,\.\.\.i\]=e;return!r\|\|r\.trim\(\)\.length===0\?null:\{executablePath:r,args:i\}\}(?:const n=VB\(t\.repoRoot\);return n\?\{executablePath:n\.executablePath,args:\["app-server"\],binDirectory:n\.binDirectory\}:null|return\{executablePath:"C:\\\\Windows\\\\System32\\\\wsl\.exe",args:\[[^\]]*\],binDirectory:null\})\}'
+  $replaced = [regex]::Replace($raw, $pattern, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $new }, 1)
+  if ($replaced -ne $raw) {
+    Set-Content -NoNewline -Path $mainFile.FullName -Value $replaced
+    return
+  }
 }
 
 
@@ -166,9 +276,102 @@ function Ensure-GitOnPath() {
   }
 }
 
+function Ensure-ElectronRuntime([string]$BaseDir, [string]$ElectronVersion) {
+  # Keep launch runtime separate from native-build workspace so build-time lock/corruption
+  # in native modules does not break GUI startup.
+  if (-not $BaseDir) { throw "WorkDir is required for Electron runtime." }
+  if (-not $ElectronVersion) { throw "Electron version is required for Electron runtime." }
+
+  $runtimeDir = Join-Path $BaseDir "electron-runtime"
+  New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
+
+  $runtimeExe = Join-Path $runtimeDir "node_modules\electron\dist\electron.exe"
+  $runtimeIcu = Join-Path $runtimeDir "node_modules\electron\dist\icudtl.dat"
+
+  $runtimeReady = (Test-Path $runtimeExe) -and (Test-Path $runtimeIcu)
+  if (-not $runtimeReady) {
+    Push-Location $runtimeDir
+    try {
+      if (-not (Test-Path (Join-Path $runtimeDir "package.json"))) {
+        & $npmCmd init -y | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "npm init failed for Electron runtime workspace." }
+      }
+
+      $electronPkg = Join-Path $runtimeDir "node_modules\electron"
+      if (Test-Path $electronPkg) {
+        Remove-Item -Recurse -Force $electronPkg -ErrorAction SilentlyContinue
+      }
+
+      & $npmCmd install --no-save "electron@$ElectronVersion" | Out-Null
+      if ($LASTEXITCODE -ne 0) { throw "npm install electron@$ElectronVersion failed." }
+    } finally {
+      Pop-Location
+    }
+  }
+
+  if (-not (Test-Path $runtimeExe) -or -not (Test-Path $runtimeIcu)) {
+    throw "Electron runtime is unavailable or incomplete at $runtimeDir."
+  }
+
+  return $runtimeExe
+}
+
+function Stop-LockingNativeElectronProcesses([string]$NativeDir) {
+  if (-not $NativeDir) { return 0 }
+  # Only kill Electron instances launched from the native-build workspace.
+  # This avoids terminating unrelated desktop apps while removing EBUSY lock holders.
+  $killed = 0
+  $nativePrefix = $NativeDir.ToLowerInvariant()
+  try {
+    $procs = Get-Process -Name "electron" -ErrorAction SilentlyContinue
+    foreach ($p in $procs) {
+      $path = $null
+      try { $path = $p.Path } catch { $path = $null }
+      if (-not $path) { continue }
+      $lower = $path.ToLowerInvariant()
+      if ($lower -like "$nativePrefix*") {
+        try {
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          $killed++
+        } catch {}
+      }
+    }
+  } catch {}
+  return $killed
+}
+
+function Stop-RuntimeElectronProcesses([string]$RuntimeExePath) {
+  if (-not $RuntimeExePath) { return 0 }
+  $killed = 0
+  $target = $RuntimeExePath.ToLowerInvariant()
+  try {
+    $procs = Get-Process -Name "electron" -ErrorAction SilentlyContinue
+    foreach ($p in $procs) {
+      $path = $null
+      try { $path = $p.Path } catch { $path = $null }
+      if (-not $path) { continue }
+      $normalized = $path.ToLowerInvariant()
+      if ($normalized -eq $target) {
+        try {
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          $killed++
+        } catch {}
+      }
+    }
+  } catch {}
+  return $killed
+}
+
 Ensure-Command node
-Ensure-Command npm
-Ensure-Command npx
+$npmCmd = Join-Path $env:ProgramFiles "nodejs\npm.cmd"
+if (-not (Test-Path $npmCmd)) {
+  throw "npm.cmd not found at $npmCmd"
+}
+
+$npxCmd = Join-Path $env:ProgramFiles "nodejs\npx.cmd"
+if (-not (Test-Path $npxCmd)) {
+  throw "npx.cmd not found at $npxCmd"
+}
 
 foreach ($k in @("npm_config_runtime","npm_config_target","npm_config_disturl","npm_config_arch","npm_config_build_from_source")) {
   if (Test-Path "Env:$k") { Remove-Item "Env:$k" -ErrorAction SilentlyContinue }
@@ -198,9 +401,10 @@ $extractedDir = Join-Path $WorkDir "extracted"
 $electronDir  = Join-Path $WorkDir "electron"
 $appDir       = Join-Path $WorkDir "app"
 $nativeDir    = Join-Path $WorkDir "native-builds"
-$packagedDir  = Join-Path $WorkDir "packaged"
 $userDataDir  = Join-Path $WorkDir "userdata"
 $cacheDir     = Join-Path $WorkDir "cache"
+$repoRoot     = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$launchLogsDir = Join-Path $repoRoot "logs\runtime"
 
 if (-not $Reuse) {
   Write-Header "Extracting DMG"
@@ -231,7 +435,7 @@ if (-not $Reuse) {
   New-Item -ItemType Directory -Force -Path $appDir | Out-Null
   $asar = Join-Path $electronDir "Codex Installer\Codex.app\Contents\Resources\app.asar"
   if (-not (Test-Path $asar)) { throw "app.asar not found." }
-  & npx --yes @electron/asar extract $asar $appDir
+  & $npxCmd --yes @electron/asar extract $asar $appDir
 
   Write-Header "Syncing app.asar.unpacked"
   $unpacked = Join-Path $electronDir "Codex Installer\Codex.app\Contents\Resources\app.asar.unpacked"
@@ -242,6 +446,10 @@ if (-not $Reuse) {
 
 Write-Header "Patching preload"
 Patch-Preload $appDir
+Patch-MainSqliteFallback $appDir
+Patch-MainCliCompat $appDir
+# WSL backend patching is opt-in only. Native Windows CLI path is the safe default.
+if ($env:CODEX_FORCE_WSL_BACKEND -eq "1") { Patch-MainWslBackend $appDir }
 
 Write-Header "Reading app metadata"
 $pkgPath = Join-Path $appDir "package.json"
@@ -264,7 +472,7 @@ if ($skipNative) {
 New-Item -ItemType Directory -Force -Path $nativeDir | Out-Null
 Push-Location $nativeDir
 if (-not (Test-Path (Join-Path $nativeDir "package.json"))) {
-  & npm init -y | Out-Null
+  & $npmCmd init -y | Out-Null
 }
 
 $bsSrcProbe = Join-Path $nativeDir "node_modules\better-sqlite3\build\Release\better_sqlite3.node"
@@ -277,12 +485,91 @@ if (-not $haveNative) {
     "better-sqlite3@$betterVersion",
     "node-pty@$ptyVersion",
     "@electron/rebuild",
-    "prebuild-install",
-    "electron@$electronVersion"
+    "prebuild-install"
   )
-  & npm install --no-save @deps
-  if ($LASTEXITCODE -ne 0) { throw "npm install failed." }
-  $electronExe = Join-Path $nativeDir "node_modules\electron\dist\electron.exe"
+
+  $installSucceeded = $false
+  $installEndedWithBusyLock = $false
+  $installAttempts = 3
+  # Proactively clear stale native electron.exe instances that commonly lock
+  # v8_context_snapshot.bin during npm rename operations.
+  $killedBeforeInstall = Stop-LockingNativeElectronProcesses $nativeDir
+  if ($killedBeforeInstall -gt 0) {
+    Write-Host "Stopped $killedBeforeInstall stale native Electron process(es) before npm install." -ForegroundColor Yellow
+    Start-Sleep -Milliseconds 600
+  }
+  for ($attempt = 1; $attempt -le $installAttempts; $attempt++) {
+    Write-Host "Installing native dependencies (attempt $attempt/$installAttempts)..." -ForegroundColor Cyan
+    # Avoid stale electron package lock contention between retries/runs.
+    $electronPkg = Join-Path $nativeDir "node_modules\electron"
+    if (Test-Path $electronPkg) {
+      Remove-Item -Recurse -Force $electronPkg -ErrorAction SilentlyContinue
+    }
+    $nodeModulesDir = Join-Path $nativeDir "node_modules"
+    if (Test-Path $nodeModulesDir) {
+      Get-ChildItem -Path $nodeModulesDir -Filter ".electron-*" -Directory -ErrorAction SilentlyContinue |
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    $installOutput = @()
+    $installExit = 1
+    $prevNativeErrorPref = $null
+    $hasNativePref = $null -ne (Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue)
+    $prevErrorActionPref = $ErrorActionPreference
+    if ($hasNativePref) {
+      $prevNativeErrorPref = $PSNativeCommandUseErrorActionPreference
+      $PSNativeCommandUseErrorActionPreference = $false
+    }
+    try {
+      # npm emits many expected stderr lines; keep them as output and decide by exit code.
+      $ErrorActionPreference = "Continue"
+      $installOutput = & $npmCmd install --no-save @deps 2>&1
+      $installExit = $LASTEXITCODE
+    } catch {
+      $installOutput += $_
+      $installExit = if ($LASTEXITCODE) { $LASTEXITCODE } else { 1 }
+    } finally {
+      $ErrorActionPreference = $prevErrorActionPref
+      if ($hasNativePref) {
+        $PSNativeCommandUseErrorActionPreference = $prevNativeErrorPref
+      }
+    }
+    $installOutput | ForEach-Object { Write-Host $_ }
+
+    if ($installExit -eq 0) {
+      $installSucceeded = $true
+      break
+    }
+
+    $installText = ($installOutput | Out-String)
+    $isBusyLock = $installText -match "EBUSY|resource busy or locked"
+    $installEndedWithBusyLock = $isBusyLock
+    if ($attempt -lt $installAttempts -and $isBusyLock) {
+      Write-Host "Detected file lock during npm install (EBUSY). Cleaning stale Electron temp dirs and retrying..." -ForegroundColor Yellow
+      # Retry path: clear any lock holder that started between attempts.
+      $killedDuringRetry = Stop-LockingNativeElectronProcesses $nativeDir
+      if ($killedDuringRetry -gt 0) {
+        Write-Host "Stopped $killedDuringRetry stale native Electron process(es) after lock detection." -ForegroundColor Yellow
+      }
+      Start-Sleep -Seconds (2 * $attempt)
+      continue
+    }
+
+    if ($attempt -eq $installAttempts -and $isBusyLock) {
+      Write-Host "Persistent EBUSY lock after retries. Continuing without native-build workspace refresh." -ForegroundColor Yellow
+      break
+    }
+
+    throw "npm install failed."
+  }
+
+  if (-not $installSucceeded) {
+    if ($installEndedWithBusyLock) {
+      Write-Host "Native dependency install skipped due file locks; proceeding with available binaries." -ForegroundColor Yellow
+    } else {
+      throw "npm install failed after retries. Close running Codex/Electron/Node processes and try again."
+    }
+  }
 } else {
   Write-Host "Native modules already present. Skipping rebuild." -ForegroundColor Cyan
 }
@@ -301,52 +588,59 @@ if (-not $haveNative) {
 }
 
 if (-not $rebuildOk -and -not $haveNative) {
-  $prebuildCli = Join-Path $nativeDir "node_modules\prebuild-install\bin.js"
-  if (-not (Test-Path $prebuildCli)) { throw "prebuild-install not found." }
   Write-Host "Trying prebuilt Electron binaries for better-sqlite3..." -ForegroundColor Yellow
   $bsDir = Join-Path $nativeDir "node_modules\better-sqlite3"
   if (Test-Path $bsDir) {
     Push-Location $bsDir
+    $prebuildCli = Join-Path $nativeDir "node_modules\prebuild-install\bin.js"
+    if (-not (Test-Path $prebuildCli)) { throw "prebuild-install not found." }
     & node $prebuildCli -r electron -t $electronVersion --tag-prefix=electron-v | Out-Null
-    Pop-Location
-  }
-  Write-Host "Trying prebuilt Electron binaries for node-pty..." -ForegroundColor Yellow
-  $ptyDir = Join-Path $nativeDir "node_modules\node-pty"
-  if (Test-Path $ptyDir) {
-    Push-Location $ptyDir
-    & node $prebuildCli -r electron -t $electronVersion --tag-prefix=electron-v 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      Write-Host "prebuild-install did not find a compatible better-sqlite3 binary." -ForegroundColor Yellow
+    }
     Pop-Location
   }
 }
 
-$env:ELECTRON_RUN_AS_NODE = "1"
-if (-not (Test-Path $electronExe)) { throw "electron.exe not found." }
-if (-not (Test-Path (Join-Path $nativeDir "node_modules\better-sqlite3"))) {
-  throw "better-sqlite3 not installed."
+$electronExe = Join-Path $nativeDir "node_modules\electron\dist\electron.exe"
+$canVerifyBetterSqlite = Test-Path $electronExe
+if (-not $canVerifyBetterSqlite) {
+  Write-Host "electron.exe not found in native-build workspace. Skipping better-sqlite runtime verification." -ForegroundColor Yellow
 }
-& $electronExe -e "try{require('./node_modules/better-sqlite3');process.exit(0)}catch(e){console.error(e);process.exit(1)}" | Out-Null
-Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
-if ($LASTEXITCODE -ne 0) { throw "better-sqlite3 failed to load." }
+$bsSrc = Join-Path $nativeDir "node_modules\better-sqlite3\build\Release\better_sqlite3.node"
+$betterSqliteReady = $false
+if (Test-Path (Join-Path $nativeDir "node_modules\better-sqlite3")) {
+  if (-not $canVerifyBetterSqlite) {
+    if (Test-Path $bsSrc) {
+      $betterSqliteReady = $true
+    } else {
+      Write-Host "better-sqlite3 binary missing and runtime verification unavailable. Continuing without it." -ForegroundColor Yellow
+    }
+  } else {
+  $env:ELECTRON_RUN_AS_NODE = "1"
+  & $electronExe -e "try{require('./node_modules/better-sqlite3');process.exit(0)}catch(e){console.error(e);process.exit(1)}" | Out-Null
+  Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
+  if ($LASTEXITCODE -eq 0 -and (Test-Path $bsSrc)) {
+    $betterSqliteReady = $true
+  } else {
+    Write-Host "better-sqlite3 is unavailable (build tools/prebuilt binary missing). Continuing without it." -ForegroundColor Yellow
+  }
+  }
+} else {
+  Write-Host "better-sqlite3 not installed. Continuing without it." -ForegroundColor Yellow
+}
 
 Pop-Location
 
-$bsSrc = Join-Path $nativeDir "node_modules\better-sqlite3\build\Release\better_sqlite3.node"
-if (-not (Test-Path $bsSrc)) {
-  $bsPrebuildDir = Join-Path $nativeDir "node_modules\better-sqlite3\prebuilds\$arch"
-  $bsPrebuild = Get-ChildItem -Path $bsPrebuildDir -Filter "better_sqlite3.node" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-  if ($bsPrebuild) { $bsSrc = $bsPrebuild.FullName }
-}
 $bsDstDir = Split-Path $bsDst -Parent
 New-Item -ItemType Directory -Force -Path $bsDstDir | Out-Null
-if (-not (Test-Path $bsSrc)) { throw "better_sqlite3.node not found (rebuild failed; install Visual Studio Build Tools or use a machine with prebuilds)." }
-Copy-Item -Force $bsSrc (Join-Path $bsDstDir "better_sqlite3.node")
+if ($betterSqliteReady) {
+  Copy-Item -Force $bsSrc (Join-Path $bsDstDir "better_sqlite3.node")
+} elseif (Test-Path $bsDst) {
+  Remove-Item -Force $bsDst -ErrorAction SilentlyContinue
+}
 
 $ptySrcDir = Join-Path $nativeDir "node_modules\node-pty\prebuilds\$arch"
-if (-not (Test-Path (Join-Path $ptySrcDir "pty.node"))) {
-  $ptyPrebuildDir = Join-Path $nativeDir "node_modules\node-pty\prebuilds"
-  $found = Get-ChildItem -Path $ptyPrebuildDir -Filter "pty.node" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-  if ($found) { $ptySrcDir = Split-Path $found.FullName -Parent }
-}
 $ptyDstRel = Join-Path $appDir "node_modules\node-pty\build\Release"
 New-Item -ItemType Directory -Force -Path $ptyDstPre | Out-Null
 New-Item -ItemType Directory -Force -Path $ptyDstRel | Out-Null
@@ -361,106 +655,31 @@ foreach ($f in $ptyFiles) {
 }
 }
 
-$packagedExe = $null
-if ($BuildExe) {
-  Write-Header "Packaging Codex.exe"
-  $packagerArch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "x64" }
-  $electronDistDir = Join-Path $nativeDir "node_modules\electron\dist"
-  if (-not (Test-Path $electronDistDir)) { throw "Electron dist not found for packaging." }
-
-  $outputDir = Join-Path $packagedDir "Codex-win32-$packagerArch"
-  if (Test-Path $outputDir) { Remove-Item -Recurse -Force $outputDir }
-  New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
-
-  Write-Host "Copying Electron runtime..." -ForegroundColor Cyan
-  & robocopy $electronDistDir $outputDir /E /NFL /NDL /NJH /NJS /NC /NS | Out-Null
-
-  $srcExe = Join-Path $outputDir "electron.exe"
-  $dstExe = Join-Path $outputDir "Codex.exe"
-  if (Test-Path $srcExe) {
-    Rename-Item -Path $srcExe -NewName "Codex.exe"
-  } elseif (-not (Test-Path $dstExe)) {
-    throw "electron.exe not found in Electron dist."
-  }
-
-  Write-Host "Copying app files to resources\app..." -ForegroundColor Cyan
-  $resourcesDir = Join-Path $outputDir "resources"
-  New-Item -ItemType Directory -Force -Path $resourcesDir | Out-Null
-  $appDstDir = Join-Path $resourcesDir "app"
-  & robocopy $appDir $appDstDir /E /NFL /NDL /NJH /NJS /NC /NS | Out-Null
-  # Remove default_app.asar so Electron loads our app/ directory
-  $defaultAsar = Join-Path $resourcesDir "default_app.asar"
-  if (Test-Path $defaultAsar) { Remove-Item -Force $defaultAsar }
-
-  # Patch main.js so the app auto-configures env vars (portable mode)
-  Write-Host "Patching main.js for portable mode..." -ForegroundColor Cyan
-  $pBuildNumber = if ($pkg.PSObject.Properties.Name -contains "codexBuildNumber" -and $pkg.codexBuildNumber) { $pkg.codexBuildNumber } else { "510" }
-  $pBuildFlavor = if ($pkg.PSObject.Properties.Name -contains "codexBuildFlavor" -and $pkg.codexBuildFlavor) { $pkg.codexBuildFlavor } else { "prod" }
-  Patch-MainForPortable $appDstDir $pBuildNumber $pBuildFlavor
-
-  # Bundle the Codex CLI binary into resources/ so the app finds it automatically
-  Write-Header "Bundling Codex CLI"
-  $cli = Resolve-CodexCliPath $CodexCliPath
-  if (-not $cli) {
-    throw "codex.exe not found. Install with: npm i -g @openai/codex"
-  }
-  $cliSrcDir = Split-Path $cli -Parent
-  Copy-Item -Force $cli (Join-Path $resourcesDir "codex.exe")
-  # Also copy sibling DLLs / support files the CLI may need
-  $cliSiblings = Get-ChildItem -Path $cliSrcDir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne (Split-Path $cli -Leaf) }
-  foreach ($sf in $cliSiblings) {
-    Copy-Item -Force $sf.FullName (Join-Path $resourcesDir $sf.Name)
-  }
-  Write-Host "Bundled CLI from: $cli" -ForegroundColor Cyan
-
-  # Create a Desktop shortcut pointing to Codex.exe
-  Write-Header "Creating Desktop shortcut"
-  $desktopPath = [Environment]::GetFolderPath("Desktop")
-  $shortcutPath = Join-Path $desktopPath "Codex.lnk"
-  try {
-    $ws = New-Object -ComObject WScript.Shell
-    $sc = $ws.CreateShortcut($shortcutPath)
-    $sc.TargetPath = $dstExe
-    $sc.WorkingDirectory = $outputDir
-    $sc.Description = "Codex"
-    $sc.Save()
-    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($ws) | Out-Null
-    Write-Host "Shortcut created: $shortcutPath" -ForegroundColor Cyan
-  } catch {
-    Write-Host "Could not create Desktop shortcut: $($_.Exception.Message)" -ForegroundColor Yellow
-  }
-
-  $packagedExe = $dstExe
-  if (-not (Test-Path $packagedExe)) { throw "Packaged exe not found: $packagedExe" }
-  Write-Host ""
-  Write-Host "=============================================" -ForegroundColor Green
-  Write-Host "  Codex packaged successfully!" -ForegroundColor Green
-  Write-Host "  Output: $outputDir" -ForegroundColor Green
-  Write-Host "" -ForegroundColor Green
-  Write-Host "  A Desktop shortcut has been created." -ForegroundColor Green
-  Write-Host "  Double-click 'Codex' on your Desktop to launch." -ForegroundColor Green
-  Write-Host "" -ForegroundColor Green
-  Write-Host "  IMPORTANT: Do NOT move Codex.exe by itself." -ForegroundColor Green
-  Write-Host "  Move the ENTIRE folder if you want to relocate." -ForegroundColor Green
-  Write-Host "=============================================" -ForegroundColor Green
-}
-
 if (-not $NoLaunch) {
   Write-Header "Resolving Codex CLI"
-  if ($packagedExe) {
-    $cli = Join-Path (Split-Path $packagedExe -Parent) "resources\codex.exe"
-    if (-not (Test-Path $cli)) {
-      $cli = Resolve-CodexCliPath $CodexCliPath
-    }
-  } else {
+  $cli = $null
+  if ($CodexCliPath) {
     $cli = Resolve-CodexCliPath $CodexCliPath
+  } else {
+    $cli = Ensure-LocalCodexCli $WorkDir
+    if (-not $cli) {
+      if ($env:CODEX_CLI_PATH) {
+        $cli = Resolve-CodexCliPath $env:CODEX_CLI_PATH
+      }
+      if (-not $cli) {
+        $cli = Resolve-CodexCliPath $null
+      }
+    }
   }
   if (-not $cli) {
     throw "codex.exe not found."
   }
+  Write-Host "Using Codex CLI: $cli" -ForegroundColor Cyan
 
   Write-Header "Launching Codex"
+  $rendererUrl = (New-Object System.Uri (Join-Path $appDir "webview\index.html")).AbsoluteUri
   Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
+  $env:ELECTRON_RENDERER_URL = $rendererUrl
   $env:ELECTRON_FORCE_IS_PACKAGED = "1"
   $buildNumber = if ($pkg.PSObject.Properties.Name -contains "codexBuildNumber" -and $pkg.codexBuildNumber) { $pkg.codexBuildNumber } else { "510" }
   $buildFlavor = if ($pkg.PSObject.Properties.Name -contains "codexBuildFlavor" -and $pkg.codexBuildFlavor) { $pkg.codexBuildFlavor } else { "prod" }
@@ -469,16 +688,59 @@ if (-not $NoLaunch) {
   $env:BUILD_FLAVOR = $buildFlavor
   $env:NODE_ENV = "production"
   $env:CODEX_CLI_PATH = $cli
+  $env:PWD = $appDir
   Ensure-GitOnPath
 
-  if ($packagedExe) {
-    Start-Process -FilePath $packagedExe -ArgumentList "--enable-logging" -NoNewWindow -Wait
-  } else {
-    $rendererUrl = (New-Object System.Uri (Join-Path $appDir "webview\index.html")).AbsoluteUri
-    $env:ELECTRON_RENDERER_URL = $rendererUrl
-    $env:PWD = $appDir
-    New-Item -ItemType Directory -Force -Path $userDataDir | Out-Null
-    New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
-    Start-Process -FilePath $electronExe -ArgumentList "$appDir","--enable-logging","--user-data-dir=`"$userDataDir`"","--disk-cache-dir=`"$cacheDir`"" -NoNewWindow -Wait
+  New-Item -ItemType Directory -Force -Path $userDataDir | Out-Null
+  New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+  New-Item -ItemType Directory -Force -Path $launchLogsDir | Out-Null
+
+  # Always launch with validated runtime Electron from work/electron-runtime.
+  # This prevents immediate startup crashes caused by a broken native-build electron install.
+  $runtimeElectronExe = Ensure-ElectronRuntime $WorkDir $electronVersion
+  $runtimeExeResolved = (Resolve-Path $runtimeElectronExe).Path.ToLowerInvariant()
+
+  # Relaunch behavior: close previous runtime electron.exe instances first, then
+  # launch a fresh instance so build+launch always opens the app predictably.
+  $stoppedRuntime = Stop-RuntimeElectronProcesses $runtimeExeResolved
+  if ($stoppedRuntime -gt 0) {
+    Write-Host "Stopped $stoppedRuntime existing Codex runtime process(es) before relaunch." -ForegroundColor Yellow
+    Start-Sleep -Milliseconds 700
+  }
+
+  $launchStamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
+  $stdoutLogPath = Join-Path $launchLogsDir ("codex-stdout-" + $launchStamp + ".log")
+  $stderrLogPath = Join-Path $launchLogsDir ("codex-stderr-" + $launchStamp + ".log")
+  $chromeLogPath = Join-Path $launchLogsDir ("codex-chromium-" + $launchStamp + ".log")
+  $launchCacheDir = Join-Path $cacheDir ("run-" + (Get-Date -Format "yyyyMMdd-HHmmss-fff"))
+  New-Item -ItemType Directory -Force -Path $launchCacheDir | Out-Null
+
+  $env:ELECTRON_ENABLE_LOGGING = "1"
+  $env:ELECTRON_LOG_FILE = $chromeLogPath
+  $electronArgs = @(
+    $appDir,
+    "--enable-logging",
+    "--log-file=`"$chromeLogPath`"",
+    "--user-data-dir=`"$userDataDir`"",
+    "--disk-cache-dir=`"$launchCacheDir`""
+  )
+  $appProc = Start-Process -FilePath $runtimeElectronExe -ArgumentList $electronArgs -PassThru -RedirectStandardOutput $stdoutLogPath -RedirectStandardError $stderrLogPath
+  if (-not $appProc -or -not $appProc.Id) {
+    throw "Failed to launch Codex Electron process."
+  }
+  Write-Host "Codex launched (PID: $($appProc.Id))." -ForegroundColor Green
+  Write-Host "Runtime logs:" -ForegroundColor DarkGray
+  Write-Host "  stdout: $stdoutLogPath" -ForegroundColor DarkGray
+  Write-Host "  stderr: $stderrLogPath" -ForegroundColor DarkGray
+  Write-Host "  chromium: $chromeLogPath" -ForegroundColor DarkGray
+  Start-Sleep -Milliseconds 1500
+  try {
+    $stillRunning = Get-Process -Id $appProc.Id -ErrorAction SilentlyContinue
+    if (-not $stillRunning) {
+      Write-Host "Codex process exited immediately after launch. See runtime logs above." -ForegroundColor Yellow
+      throw "Codex exited immediately after launch."
+    }
+  } catch {
+    if ($_.Exception.Message -like "Codex exited immediately after launch.*") { throw }
   }
 }
