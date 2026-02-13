@@ -1,3 +1,35 @@
-# Generated output (not uploaded)
-work/
-Codex.dmg
+# Build/extraction outputs
+/work/
+/native-builds/
+/app/
+/electron/
+/extracted/
+
+# Node dependencies
+/node_modules/
+/codex-windows-setup-tool/node_modules/
+
+# Logs and temp files
+*.log
+logs/
+/logs/runtime/
+/logs/wizard-debug-*.log
+*.tmp
+*.download
+
+# Crash dumps and diagnostics
+*.dmp
+*.mdmp
+*.stackdump
+
+# Test/coverage artifacts
+coverage/
+.nyc_output/
+
+# Local desktop shortcuts and OS noise
+*.lnk
+.DS_Store
+Thumbs.db
+
+# Local DMG assets
+*.dmg

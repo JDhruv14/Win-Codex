@@ -1,0 +1,15 @@
+{
+  "name": "codex-windows-setup",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "codex-windows-setup": "node codex-windows-setup-tool/index.js",
+    "codex-windows-setup:debug": "node codex-windows-setup-tool/index.js --debug",
+    "codex-windows-setup:verify": "node codex-windows-setup-tool/index.js --verify",
+    "codex-windows-setup:verify:debug": "node codex-windows-setup-tool/index.js --verify --debug",
+    "test": "node --test",
+    "test:integration": "RUN_WINDOWS_INTEGRATION=1 node --test",
+    "test:unit": "node --test --test-skip-pattern \"windows integration\""
+  }
+}
