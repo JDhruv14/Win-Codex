@@ -231,7 +231,14 @@ if (-not $Reuse) {
   New-Item -ItemType Directory -Force -Path $appDir | Out-Null
   $asar = Join-Path $electronDir "Codex Installer\Codex.app\Contents\Resources\app.asar"
   if (-not (Test-Path $asar)) { throw "app.asar not found." }
-  & npx --yes @electron/asar extract $asar $appDir
+  & npm exec --yes --package @electron/asar -- asar extract $asar $appDir
+  if ($LASTEXITCODE -ne 0) {
+    throw @"
+Failed to extract app.asar (exit code: $LASTEXITCODE).
+Verify npm can run the asar CLI:
+  npm exec --yes --package @electron/asar -- asar --version
+"@
+  }
 
   Write-Header "Syncing app.asar.unpacked"
   $unpacked = Join-Path $electronDir "Codex Installer\Codex.app\Contents\Resources\app.asar.unpacked"
@@ -245,7 +252,14 @@ Patch-Preload $appDir
 
 Write-Header "Reading app metadata"
 $pkgPath = Join-Path $appDir "package.json"
-if (-not (Test-Path $pkgPath)) { throw "package.json not found." }
+if (-not (Test-Path $pkgPath)) {
+  throw @"
+package.json not found after app.asar extraction.
+The extraction step may have failed earlier.
+Try:
+  npm exec --yes --package @electron/asar -- asar --version
+"@
+}
 $pkg = Get-Content -Raw $pkgPath | ConvertFrom-Json
 $electronVersion = $pkg.devDependencies.electron
 $betterVersion = $pkg.dependencies."better-sqlite3"

@@ -110,6 +110,12 @@ winget install --id 7zip.7zip -e
 
 If `winget` is unavailable, install 7-Zip manually, then rerun `.\scripts\run.ps1` or `run.cmd`.
 
+If you see `package.json not found after app.asar extraction` (or `could not determine executable to run`), verify the asar CLI works:
+
+```powershell
+npm exec --yes --package @electron/asar -- asar --version
+```
+
 ## Notes
 
 - This is **not** an official OpenAI project.
