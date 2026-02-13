@@ -7,13 +7,22 @@ if not exist "%SCRIPT%" (
   exit /b 1
 )
 
+if /I "%~1"=="-h" goto :usage
+if /I "%~1"=="--help" goto :usage
+if /I "%~1"=="/?" goto :usage
+
 if "%~1"=="" (
-  echo Usage:
-  echo   run.cmd
-  echo   run.cmd -DmgPath .\Codex.dmg
-  echo Optional:
-  echo   -WorkDir .\work  -CodexCliPath C:\path\to\codex.exe  -Reuse  -BuildExe
-  exit /b 0
+  powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%"
+  exit /b %errorlevel%
 )
 
 powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" %*
+exit /b %errorlevel%
+
+:usage
+echo Usage:
+echo   run.cmd
+echo   run.cmd -DmgPath .\Codex.dmg
+echo Optional:
+echo   -WorkDir .\work  -CodexCliPath C:\path\to\codex.exe  -Reuse  -BuildExe -NoLaunch
+exit /b 0
