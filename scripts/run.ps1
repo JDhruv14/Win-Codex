@@ -25,29 +25,22 @@ function Resolve-7z([string]$BaseDir) {
   if (Test-Path $p2) { return $p2 }
   $wg = Get-Command winget -ErrorAction SilentlyContinue
   if ($wg) {
-    & winget install --id 7zip.7zip -e --source winget --accept-package-agreements --accept-source-agreements --silent | Out-Null
+    Write-Host "7-Zip not found. Trying to install with winget..." -ForegroundColor Yellow
+    try {
+      & winget install --id 7zip.7zip -e --source winget --accept-package-agreements --accept-source-agreements --silent | Out-Null
+    } catch {}
     if (Test-Path $p1) { return $p1 }
     if (Test-Path $p2) { return $p2 }
+    $cmd = Get-Command 7z -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Path }
   }
-  if (-not $BaseDir) { return $null }
-  $tools = Join-Path $BaseDir "tools"
-  New-Item -ItemType Directory -Force -Path $tools | Out-Null
-  $sevenZipDir = Join-Path $tools "7zip"
-  New-Item -ItemType Directory -Force -Path $sevenZipDir | Out-Null
-  $home = "https://www.7-zip.org/"
-  try { $html = (Invoke-WebRequest -Uri $home -UseBasicParsing).Content } catch { return $null }
-  $extra = [regex]::Match($html, 'href="a/(7z[0-9]+-extra\.7z)"').Groups[1].Value
-  if (-not $extra) { return $null }
-  $extraUrl = "https://www.7-zip.org/a/$extra"
-  $sevenRUrl = "https://www.7-zip.org/a/7zr.exe"
-  $sevenR = Join-Path $tools "7zr.exe"
-  $extraPath = Join-Path $tools $extra
-  if (-not (Test-Path $sevenR)) { Invoke-WebRequest -Uri $sevenRUrl -OutFile $sevenR }
-  if (-not (Test-Path $extraPath)) { Invoke-WebRequest -Uri $extraUrl -OutFile $extraPath }
-  & $sevenR x -y $extraPath -o"$sevenZipDir" | Out-Null
-  $p3 = Join-Path $sevenZipDir "7z.exe"
-  if (Test-Path $p3) { return $p3 }
-  return $null
+
+  throw @"
+7z not found.
+Install 7-Zip with:
+  winget install --id 7zip.7zip -e
+If winget is unavailable, install 7-Zip manually and rerun this script.
+"@
 }
 
 function Resolve-CodexCliPath([string]$Explicit) {
@@ -192,7 +185,14 @@ $DmgPath = (Resolve-Path $DmgPath).Path
 $WorkDir = (Resolve-Path (New-Item -ItemType Directory -Force -Path $WorkDir)).Path
 
 $sevenZip = Resolve-7z $WorkDir
-if (-not $sevenZip) { throw "7z not found." }
+if (-not $sevenZip) {
+  throw @"
+7z not found.
+Install 7-Zip with:
+  winget install --id 7zip.7zip -e
+If winget is unavailable, install 7-Zip manually and rerun this script.
+"@
+}
 
 $extractedDir = Join-Path $WorkDir "extracted"
 $electronDir  = Join-Path $WorkDir "electron"
@@ -231,7 +231,14 @@ if (-not $Reuse) {
   New-Item -ItemType Directory -Force -Path $appDir | Out-Null
   $asar = Join-Path $electronDir "Codex Installer\Codex.app\Contents\Resources\app.asar"
   if (-not (Test-Path $asar)) { throw "app.asar not found." }
-  & npx --yes @electron/asar extract $asar $appDir
+  & npm exec --yes --package @electron/asar -- asar extract $asar $appDir
+  if ($LASTEXITCODE -ne 0) {
+    throw @"
+Failed to extract app.asar (exit code: $LASTEXITCODE).
+Verify npm can run the asar CLI:
+  npm exec --yes --package @electron/asar -- asar --version
+"@
+  }
 
   Write-Header "Syncing app.asar.unpacked"
   $unpacked = Join-Path $electronDir "Codex Installer\Codex.app\Contents\Resources\app.asar.unpacked"
@@ -245,7 +252,14 @@ Patch-Preload $appDir
 
 Write-Header "Reading app metadata"
 $pkgPath = Join-Path $appDir "package.json"
-if (-not (Test-Path $pkgPath)) { throw "package.json not found." }
+if (-not (Test-Path $pkgPath)) {
+  throw @"
+package.json not found after app.asar extraction.
+The extraction step may have failed earlier.
+Try:
+  npm exec --yes --package @electron/asar -- asar --version
+"@
+}
 $pkg = Get-Content -Raw $pkgPath | ConvertFrom-Json
 $electronVersion = $pkg.devDependencies.electron
 $betterVersion = $pkg.dependencies."better-sqlite3"

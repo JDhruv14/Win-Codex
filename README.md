@@ -24,7 +24,7 @@ A Windows runner that extracts the Codex DMG (macOS installer), rebuilds native 
 - **Runtime**: [Node.js](https://nodejs.org/) (for the build script)
 - **Packaging**: [Electron](https://www.electronjs.org/) (version read from the app’s `package.json`)
 - **Native modules**: better-sqlite3, node-pty (prebuilds or [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) for rebuild)
-- **Script**: PowerShell (`run.ps1`), 7-Zip (auto-installed via `winget` if missing)
+- **Script**: PowerShell (`run.ps1`), 7-Zip (auto-detected; script attempts `winget` install if missing)
 
 ## Project Structure
 
@@ -45,7 +45,7 @@ Generated output (extracted app, native builds, and the portable `Codex-win32-x6
 
 - **Windows 10 or 11**
 - **Node.js** (for running the script)
-- **7-Zip** — if not installed, the script will try `winget` or download a portable copy
+- **7-Zip** — preferred preinstalled; if missing, the script attempts `winget install --id 7zip.7zip -e`
 - **Codex CLI** (for first run or if not building portable):  
   `npm i -g @openai/codex`
 
@@ -69,6 +69,7 @@ run.cmd
 ```
 
 The script will extract the DMG, prepare the app, auto-detect `codex.exe`, and launch Codex.
+Use `run.cmd -h` for usage/help.
 
 ### 4. Build a portable Codex.exe (recommended)
 
@@ -98,6 +99,22 @@ Build a self-contained app and a Desktop shortcut:
 | Custom DMG        | `.\scripts\run.ps1 -DmgPath .\path\to\Codex.dmg`      |
 | Reuse existing    | `.\scripts\run.ps1 -BuildExe -Reuse` (skips re-extract) |
 | Custom work dir   | `.\scripts\run.ps1 -WorkDir .\mywork`                 |
+
+## Troubleshooting
+
+If you get `7z not found`, install 7-Zip with:
+
+```powershell
+winget install --id 7zip.7zip -e
+```
+
+If `winget` is unavailable, install 7-Zip manually, then rerun `.\scripts\run.ps1` or `run.cmd`.
+
+If you see `package.json not found after app.asar extraction` (or `could not determine executable to run`), verify the asar CLI works:
+
+```powershell
+npm exec --yes --package @electron/asar -- asar --version
+```
 
 ## Notes
 
