@@ -12,7 +12,7 @@ if "%~1"=="" (
   echo   run.cmd
   echo   run.cmd -DmgPath .\Codex.dmg
   echo Optional:
-  echo   -WorkDir .\work  -CodexCliPath C:\path\to\codex.exe  -Reuse  -BuildExe
+  echo   -WorkDir .\work  -CodexCliPath C:\path\to\codex.exe  -Reuse
   exit /b 0
 )
 
