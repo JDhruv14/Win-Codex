@@ -1,6 +1,7 @@
 param(
   [string]$DmgPath,
   [string]$WorkDir = (Join-Path $PSScriptRoot "..\work-superset"),
+  [string]$ElectronVersion,
   [switch]$Reuse,
   [switch]$NoLaunch,
   [switch]$BuildExe
@@ -69,7 +70,7 @@ function Ensure-GitOnPath() {
   }
 }
 
-# ── App discovery ────────────────────────────────────────────────────────────
+# ── App & Electron discovery ─────────────────────────────────────────────────
 
 function Find-AsarPath([string]$SearchRoot) {
   $found = Get-ChildItem -Path $SearchRoot -Filter "app.asar" -Recurse -ErrorAction SilentlyContinue |
@@ -81,6 +82,28 @@ function Find-AsarPath([string]$SearchRoot) {
     Select-Object -First 1
   if ($anyAsar) { return $anyAsar.FullName }
 
+  return $null
+}
+
+function Find-ElectronVersion([string]$ExtractedDir, [string]$PkgElectronVer) {
+  if ($PkgElectronVer) { return $PkgElectronVer -replace '^\^','' }
+
+  $plists = Get-ChildItem -Path $ExtractedDir -Filter "Info.plist" -Recurse -ErrorAction SilentlyContinue |
+    Where-Object { $_.FullName -like "*Electron Framework*" }
+  foreach ($plist in $plists) {
+    $content = Get-Content -Raw $plist.FullName
+    $m = [regex]::Match($content, '<key>CFBundleVersion</key>\s*<string>([^<]+)</string>')
+    if ($m.Success) { return $m.Groups[1].Value }
+  }
+
+  return $null
+}
+
+function Find-ExtraResources([string]$ExtractedDir) {
+  $migrations = Get-ChildItem -Path $ExtractedDir -Filter "migrations" -Directory -Recurse -ErrorAction SilentlyContinue |
+    Where-Object { $_.FullName -like "*Resources*resources*migrations" -and $_.FullName -notlike "*app.asar*" } |
+    Select-Object -First 1
+  if ($migrations) { return (Split-Path $migrations.FullName -Parent) }
   return $null
 }
 
@@ -208,13 +231,14 @@ $cacheDir     = Join-Path $WorkDir "cache"
 
 # ── Extract DMG & app.asar ──────────────────────────────────────────────────
 
+$extraResourcesDir = $null
 if (-not $Reuse) {
   Write-Header "Extracting DMG"
   if (Test-Path $extractedDir) { Remove-Item -Recurse -Force $extractedDir }
   New-Item -ItemType Directory -Force -Path $extractedDir | Out-Null
   & $sevenZip x -y $DmgPath -o"$extractedDir" | Out-Null
 
-  # electron-builder DMGs may contain HFS partitions that need a second extraction
+  # On Windows, 7z may leave HFS partitions as files that need a second extraction
   $hfsFiles = Get-ChildItem -Path $extractedDir -Filter "*.hfs" -File -ErrorAction SilentlyContinue
   foreach ($hfs in $hfsFiles) {
     Write-Host "  Extracting HFS partition: $($hfs.Name)" -ForegroundColor Cyan
@@ -228,6 +252,23 @@ if (-not $Reuse) {
 
   $asarDir = Split-Path $asarPath -Parent
   $unpackedPath = Join-Path $asarDir "app.asar.unpacked"
+
+  # Detect Electron version from the Electron Framework plist inside the DMG
+  if (-not $ElectronVersion) {
+    $ElectronVersion = Find-ElectronVersion $extractedDir $null
+    if ($ElectronVersion) {
+      Write-Host "  Detected Electron version from framework: $ElectronVersion" -ForegroundColor Green
+    }
+  }
+
+  # Locate extraResources (migrations etc.) placed outside the asar by electron-builder
+  $extraResourcesDir = Find-ExtraResources $extractedDir
+  if ($extraResourcesDir) {
+    $savedExtraRes = Join-Path $WorkDir "extra-resources"
+    if (Test-Path $savedExtraRes) { Remove-Item -Recurse -Force $savedExtraRes }
+    & robocopy $extraResourcesDir $savedExtraRes /E /NFL /NDL /NJH /NJS /NC /NS | Out-Null
+    Write-Host "  Saved extraResources: $extraResourcesDir" -ForegroundColor Green
+  }
 
   if (Test-Path $electronDir) { Remove-Item -Recurse -Force $electronDir }
   New-Item -ItemType Directory -Force -Path $electronDir | Out-Null
@@ -255,12 +296,18 @@ $pkgPath = Join-Path $appDir "package.json"
 if (-not (Test-Path $pkgPath)) { throw "package.json not found in extracted app." }
 $pkg = Get-Content -Raw $pkgPath | ConvertFrom-Json
 
-$electronVersion = $null
-if ($pkg.PSObject.Properties.Name -contains "devDependencies" -and $pkg.devDependencies.electron) {
-  $electronVersion = $pkg.devDependencies.electron -replace '^\^',''
+# Electron version: parameter > devDependencies > plist detection > default
+if (-not $ElectronVersion) {
+  if ($pkg.PSObject.Properties.Name -contains "devDependencies" -and $pkg.devDependencies.PSObject.Properties.Name -contains "electron") {
+    $ElectronVersion = $pkg.devDependencies.electron -replace '^\^',''
+  }
 }
-if (-not $electronVersion) {
-  throw "Electron version not found in app package.json."
+if (-not $ElectronVersion) {
+  $ElectronVersion = Find-ElectronVersion $extractedDir $null
+}
+if (-not $ElectronVersion) {
+  $ElectronVersion = "40.2.1"
+  Write-Host "  Warning: Electron version not detected, using default $ElectronVersion" -ForegroundColor Yellow
 }
 
 $betterSqliteVer = if ($pkg.dependencies."better-sqlite3") { $pkg.dependencies."better-sqlite3" } else { "12.6.2" }
@@ -272,7 +319,7 @@ $appName    = if ($pkg.productName) { $pkg.productName } else { "Superset" }
 $appVersion = if ($pkg.version) { $pkg.version } else { "0.0.0" }
 
 Write-Host "  App: $appName v$appVersion"
-Write-Host "  Electron: $electronVersion"
+Write-Host "  Electron: $ElectronVersion"
 Write-Host "  better-sqlite3: $betterSqliteVer"
 Write-Host "  node-pty: $nodePtyVer"
 Write-Host "  @ast-grep/napi: $astGrepVer"
@@ -284,10 +331,13 @@ Write-Header "Preparing native modules for Windows"
 $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "win32-arm64" } else { "win32-x64" }
 $npmArch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "x64" }
 
-$bsDst    = Join-Path $appDir "node_modules\better-sqlite3\build\Release\better_sqlite3.node"
+$bsDst     = Join-Path $appDir "node_modules\better-sqlite3\build\Release\better_sqlite3.node"
 $ptyDstPre = Join-Path $appDir "node_modules\node-pty\prebuilds\$arch"
 
-$skipNative = $NoLaunch -and $Reuse -and (Test-Path $bsDst) -and (Test-Path (Join-Path $ptyDstPre "pty.node"))
+# node-pty ships with Windows prebuilds inside the DMG — check if they already exist
+$existingPtyPrebuilds = Test-Path (Join-Path $ptyDstPre "pty.node")
+
+$skipNative = $NoLaunch -and $Reuse -and (Test-Path $bsDst) -and $existingPtyPrebuilds
 if ($skipNative) {
   Write-Host "Native modules already present. Skipping rebuild." -ForegroundColor Cyan
 } else {
@@ -300,19 +350,23 @@ if ($skipNative) {
 
   $electronExe = Join-Path $nativeDir "node_modules\electron\dist\electron.exe"
   $bsSrcProbe = Join-Path $nativeDir "node_modules\better-sqlite3\build\Release\better_sqlite3.node"
-  $ptySrcProbe = Join-Path $nativeDir "node_modules\node-pty\prebuilds\$arch\pty.node"
-  $haveNative = (Test-Path $bsSrcProbe) -and (Test-Path $ptySrcProbe) -and (Test-Path $electronExe)
+  $haveNative = (Test-Path $bsSrcProbe) -and (Test-Path $electronExe)
 
   if (-not $haveNative) {
-    Write-Host "Installing native modules and Electron $electronVersion..." -ForegroundColor Cyan
+    Write-Host "Installing native modules and Electron $ElectronVersion..." -ForegroundColor Cyan
 
     $deps = @(
       "better-sqlite3@$betterSqliteVer",
-      "node-pty@$nodePtyVer",
       "@electron/rebuild",
       "prebuild-install",
-      "electron@$electronVersion"
+      "electron@$ElectronVersion"
     )
+
+    # Only install node-pty from npm if the DMG didn't ship usable prebuilds
+    if (-not $existingPtyPrebuilds) {
+      $deps += "node-pty@$nodePtyVer"
+    }
+
     & npm install --no-save @deps
     if ($LASTEXITCODE -ne 0) { throw "npm install failed for native modules." }
 
@@ -341,14 +395,17 @@ if ($skipNative) {
     Write-Host "Native modules already built. Skipping install." -ForegroundColor Cyan
   }
 
-  # Rebuild better-sqlite3 and node-pty for Electron's Node ABI
-  Write-Host "Rebuilding native modules for Electron $electronVersion..." -ForegroundColor Cyan
+  # Rebuild better-sqlite3 for Electron's Node ABI
+  $rebuildModules = "better-sqlite3"
+  if (-not $existingPtyPrebuilds) { $rebuildModules = "better-sqlite3,node-pty" }
+
+  Write-Host "Rebuilding $rebuildModules for Electron $ElectronVersion..." -ForegroundColor Cyan
   $rebuildOk = $true
   if (-not $haveNative) {
     try {
       $rebuildCli = Join-Path $nativeDir "node_modules\@electron\rebuild\lib\cli.js"
       if (-not (Test-Path $rebuildCli)) { throw "electron-rebuild not found." }
-      & node $rebuildCli -v $electronVersion -w "better-sqlite3,node-pty" | Out-Null
+      & node $rebuildCli -v $ElectronVersion -w $rebuildModules | Out-Null
     } catch {
       $rebuildOk = $false
       Write-Host "electron-rebuild failed: $($_.Exception.Message)" -ForegroundColor Yellow
@@ -358,18 +415,21 @@ if ($skipNative) {
   if (-not $rebuildOk -and -not $haveNative) {
     $prebuildCli = Join-Path $nativeDir "node_modules\prebuild-install\bin.js"
     if (-not (Test-Path $prebuildCli)) { throw "prebuild-install not found." }
-    Write-Host "Trying prebuilt Electron binaries..." -ForegroundColor Yellow
+    Write-Host "Trying prebuilt Electron binaries for better-sqlite3..." -ForegroundColor Yellow
     $bsDir = Join-Path $nativeDir "node_modules\better-sqlite3"
     if (Test-Path $bsDir) {
       Push-Location $bsDir
-      & node $prebuildCli -r electron -t $electronVersion --tag-prefix=electron-v | Out-Null
+      & node $prebuildCli -r electron -t $ElectronVersion --tag-prefix=electron-v | Out-Null
       Pop-Location
     }
-    $ptyDir = Join-Path $nativeDir "node_modules\node-pty"
-    if (Test-Path $ptyDir) {
-      Push-Location $ptyDir
-      & node $prebuildCli -r electron -t $electronVersion --tag-prefix=electron-v 2>$null | Out-Null
-      Pop-Location
+    if (-not $existingPtyPrebuilds) {
+      Write-Host "Trying prebuilt Electron binaries for node-pty..." -ForegroundColor Yellow
+      $ptyDir = Join-Path $nativeDir "node_modules\node-pty"
+      if (Test-Path $ptyDir) {
+        Push-Location $ptyDir
+        & node $prebuildCli -r electron -t $ElectronVersion --tag-prefix=electron-v 2>$null | Out-Null
+        Pop-Location
+      }
     }
   }
 
@@ -405,30 +465,64 @@ if ($skipNative) {
     throw "better_sqlite3.node not found. Install Visual Studio Build Tools or use a machine with prebuilds."
   }
 
-  # node-pty
-  $ptySrcDir = Join-Path $nativeDir "node_modules\node-pty\prebuilds\$arch"
-  if (-not (Test-Path (Join-Path $ptySrcDir "pty.node"))) {
-    $ptyPrebuildDir = Join-Path $nativeDir "node_modules\node-pty\prebuilds"
-    $found = Get-ChildItem -Path $ptyPrebuildDir -Filter "pty.node" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($found) { $ptySrcDir = Split-Path $found.FullName -Parent }
-  }
-  $ptyDstRel = Join-Path $appDir "node_modules\node-pty\build\Release"
-  New-Item -ItemType Directory -Force -Path $ptyDstPre | Out-Null
-  New-Item -ItemType Directory -Force -Path $ptyDstRel | Out-Null
-  $ptyFiles = @("pty.node", "conpty.node", "conpty_console_list.node")
-  $ptyCopied = $false
-  foreach ($f in $ptyFiles) {
-    $src = Join-Path $ptySrcDir $f
-    if (Test-Path $src) {
-      Copy-Item -Force $src (Join-Path $ptyDstPre $f)
-      Copy-Item -Force $src (Join-Path $ptyDstRel $f)
-      $ptyCopied = $true
+  # node-pty — use DMG prebuilds if available, otherwise copy from npm install
+  if ($existingPtyPrebuilds) {
+    Write-Host "  node-pty -> OK (using existing DMG prebuilds for $arch)" -ForegroundColor Green
+  } else {
+    $ptySrcDir = Join-Path $nativeDir "node_modules\node-pty\prebuilds\$arch"
+    if (-not (Test-Path (Join-Path $ptySrcDir "pty.node"))) {
+      $ptyPrebuildDir = Join-Path $nativeDir "node_modules\node-pty\prebuilds"
+      $found = Get-ChildItem -Path $ptyPrebuildDir -Filter "pty.node" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+      if ($found) { $ptySrcDir = Split-Path $found.FullName -Parent }
+    }
+    $ptyDstRel = Join-Path $appDir "node_modules\node-pty\build\Release"
+    New-Item -ItemType Directory -Force -Path $ptyDstPre | Out-Null
+    New-Item -ItemType Directory -Force -Path $ptyDstRel | Out-Null
+
+    # Copy all prebuild files including conpty subdirectory
+    if (Test-Path $ptySrcDir) {
+      Get-ChildItem -Path $ptySrcDir -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
+        $relPath = $_.FullName.Substring($ptySrcDir.Length)
+        $dstFile = Join-Path $ptyDstPre $relPath
+        New-Item -ItemType Directory -Force -Path (Split-Path $dstFile -Parent) | Out-Null
+        Copy-Item -Force $_.FullName $dstFile
+        # Also copy .node files to build/Release for fallback module loading
+        if ($_.Extension -eq ".node") {
+          Copy-Item -Force $_.FullName (Join-Path $ptyDstRel $_.Name)
+        }
+      }
+      Write-Host "  node-pty -> OK (rebuilt from npm)" -ForegroundColor Green
+    } else {
+      Write-Host "  node-pty: prebuilds not found (terminal features may not work)" -ForegroundColor Yellow
     }
   }
-  if ($ptyCopied) {
-    Write-Host "  node-pty -> OK" -ForegroundColor Green
-  } else {
-    Write-Host "  node-pty: prebuilds not found (terminal features may not work)" -ForegroundColor Yellow
+
+  # Remove macOS/Linux prebuilds from node-pty to save space and avoid confusion
+  $ptyPrebuildsBase = Join-Path $appDir "node_modules\node-pty\prebuilds"
+  if (Test-Path $ptyPrebuildsBase) {
+    Get-ChildItem -Path $ptyPrebuildsBase -Directory -Filter "darwin-*" -ErrorAction SilentlyContinue |
+      ForEach-Object { Remove-Item -Recurse -Force $_.FullName }
+    Get-ChildItem -Path $ptyPrebuildsBase -Directory -Filter "linux-*" -ErrorAction SilentlyContinue |
+      ForEach-Object { Remove-Item -Recurse -Force $_.FullName }
+  }
+
+  # Copy winpty/conpty supporting files to build/Release for node-pty
+  $ptyWinFiles = @("winpty.dll", "winpty-agent.exe")
+  $ptyDstRel = Join-Path $appDir "node_modules\node-pty\build\Release"
+  foreach ($wf in $ptyWinFiles) {
+    $src = Join-Path $ptyDstPre $wf
+    if (Test-Path $src) {
+      Copy-Item -Force $src (Join-Path $ptyDstRel $wf)
+    }
+  }
+  # Copy conpty subdirectory to build/Release if it exists
+  $conptySrc = Join-Path $ptyDstPre "conpty"
+  $conptyDst = Join-Path $ptyDstRel "conpty"
+  if (Test-Path $conptySrc) {
+    New-Item -ItemType Directory -Force -Path $conptyDst | Out-Null
+    Get-ChildItem -Path $conptySrc -File -ErrorAction SilentlyContinue | ForEach-Object {
+      Copy-Item -Force $_.FullName (Join-Path $conptyDst $_.Name)
+    }
   }
 
   # @ast-grep/napi — copy platform-specific package into app
@@ -440,7 +534,6 @@ if ($skipNative) {
       $astGrepDst = Join-Path $astGrepAppDir $astGrepPlatPkg
       if (Test-Path $astGrepDst) { Remove-Item -Recurse -Force $astGrepDst }
       & robocopy $astGrepSrc $astGrepDst /E /NFL /NDL /NJH /NJS /NC /NS | Out-Null
-      # Remove macOS platform packages that won't work on Windows
       Get-ChildItem -Path $astGrepAppDir -Directory -Filter "napi-darwin-*" -ErrorAction SilentlyContinue |
         ForEach-Object { Remove-Item -Recurse -Force $_.FullName }
       Get-ChildItem -Path $astGrepAppDir -Directory -Filter "napi-linux-*" -ErrorAction SilentlyContinue |
@@ -460,7 +553,6 @@ if ($skipNative) {
       $libsqlDst = Join-Path $libsqlAppDir $libsqlPlatPkg
       if (Test-Path $libsqlDst) { Remove-Item -Recurse -Force $libsqlDst }
       & robocopy $libsqlSrc $libsqlDst /E /NFL /NDL /NJH /NJS /NC /NS | Out-Null
-      # Remove macOS/Linux platform packages
       Get-ChildItem -Path $libsqlAppDir -Directory -Filter "darwin-*" -ErrorAction SilentlyContinue |
         ForEach-Object { Remove-Item -Recurse -Force $_.FullName }
       Get-ChildItem -Path $libsqlAppDir -Directory -Filter "linux-*" -ErrorAction SilentlyContinue |
@@ -507,6 +599,13 @@ if ($BuildExe) {
   New-Item -ItemType Directory -Force -Path $resourcesDir | Out-Null
   $appDstDir = Join-Path $resourcesDir "app"
   & robocopy $appDir $appDstDir /E /NFL /NDL /NJH /NJS /NC /NS | Out-Null
+
+  # Copy extraResources (migrations) alongside the app
+  $savedExtraRes = Join-Path $WorkDir "extra-resources"
+  if (Test-Path $savedExtraRes) {
+    & robocopy $savedExtraRes (Join-Path $resourcesDir "resources") /E /NFL /NDL /NJH /NJS /NC /NS | Out-Null
+    Write-Host "  Copied extraResources (migrations)" -ForegroundColor Green
+  }
 
   $defaultAsar = Join-Path $resourcesDir "default_app.asar"
   if (Test-Path $defaultAsar) { Remove-Item -Force $defaultAsar }
